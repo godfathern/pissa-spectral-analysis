@@ -1,247 +1,155 @@
-# BigData2026 Assignment 1 — Analysis of SVD for Fine-Tuning LLMs
+# Which Singular Directions Matter? A Spectral Study of SVD-Initialized LoRA for LLM Fine-Tuning
 
-This repository contains the implementation code modified based on the paper **PiSSA (Principal Singular Values and Singular Vectors Adaptation)** published at NeurIPS 2024 (For full paper information, please refer to "References").  
+**PiSSA** (Meng et al., NeurIPS 2024) improves on LoRA by initializing the low-rank adapter from
+the **top-r singular components** of each pretrained weight matrix instead of from noise and zeros.
+This project tests the assumption behind that choice:
 
-The code is adapted from the original PiSSA implementation and modified to study how different parts of the singular-value spectrum affect low-rank fine-tuning.
+> *Is it the principal subspace specifically that makes SVD-based initialization work, or would
+> any slice of the singular-value spectrum do?*
 
-Original work:
+Building on the official PiSSA method, I wrote a PyTorch implementation and generalized it so the adapter can be
+initialized from **any window of the spectrum** (top, 25th percentile, median, or bottom). I then
+fine-tuned **Llama-3.2-1B** on mathematical reasoning (MetaMathQA) and evaluated it on **GSM8K**
+and **MATH**, varying rank and spectral position independently. A separate analysis of the
+singular-value spectra of Llama's attention weights shows how much "energy" a rank-r adapter can
+actually capture in each layer.
 
-- Paper: [PiSSA: Principal Singular Values and Singular Vectors Adaptation of Large Language Models](https://proceedings.neurips.cc/paper_files/paper/2024/hash/db36f4d603cc9e3a2a5e10b93e6428f2-Abstract-Conference.html)
-- Official code: [MuLabPKU/PiSSA](https://github.com/MuLabPKU/PiSSA)
+---
 
-## File Description
+## Highlights
 
-- ```finetune_q1-q3.ipynb```: File for Question 1 to Question 3 in Assignment 1.
-- ```finetune_q4.ipynb```: File for Question 4 in Assignment 1.
+- **Custom PiSSA adapter.** A `PiSSALinear` layer holds a frozen residual
+  weight and trainable low-rank factors, injected into all 7 projection types (`q, k, v, o, gate,
+  up, down`) across all 16 decoder layers (112 layers).
+- **Spectral-window initialization.** One `component` switch picks which singular values form the
+  adapter: `default` (top-r), `quarter`, `half` or `bottom`.
+- **Exact reconstruction.** Before training, the decomposition W = W_res + AB is checked to
+  within **2 × 10⁻⁴** maximum relative error, so the model's starting behavior is unchanged.
+- **Rigorous evaluation pipeline.** Response-only loss masking, batched generation, an answer
+  parser that handles several output formats (`The answer is:`, `####`, `\boxed{}`), and
+  LaTeX-aware normalization for MATH with a numeric-equivalence fallback (e.g. `0.5 ≡ 1/2`).
+- **Runs on modest hardware.** FP16 with FP32 adapter math, gradient accumulation to an effective
+  batch of 128, and `DataParallel` across 2× T4 GPUs on Kaggle.
 
-The two ```.ipynb``` files can be run independently.
+## Method
 
-## Code Description
-
-This code fine-tunes `meta-llama/Llama-3.2-1B` on `MetaMathQA` and evaluates it on two datasets: `GSM8K` and `MATH`.
-
-### 1. Configuration
-
-The configuration cell defines the model, datasets, training hyperparameters, evaluation settings, output directory, and PiSSA runs.
-
-Important settings include:
-
-```python
-MODEL_ID = "meta-llama/Llama-3.2-1B"
-METAMATH_TRAIN_LIMIT = 25000
-MAX_LENGTH = 512
-EPOCHS = 1
-LEARNING_RATE = 2e-5
-TARGET_GLOBAL_BATCH = 128
-```
-
-### 2. Settings for SVD
-
-- `rank`: the target rank used for truncated SVD
-- `component`: the selected range of singular values, corresponding to the settings in Question 3
-- `RUN_FRESH_BASELINE`: used to evaluate the original LLM without fine-tuning
-
-
-```python
-
-"""
-`MANUAL_RUNS` is used to configure the SVD settings for fine-tuning the LLM.
-   - 'rank': the target rank used for truncated SVD
-   - 'component': the selected range of singular values, corresponding to the settings in Question 3
-"""
-MANUAL_RUNS = [
-   {'rank': 16, 'component': 'default'},
-]
-
-"""
-`RUN_FRESH_BASELINE` is used to evaluate the original LLM without fine-tuning.
-   - True: runs the original LLM as the baseline.
-   - False: skips the baseline evaluation.
-"""
-RUN_FRESH_BASELINE = True
-```
-
-### 3. Dataset Preparation
-
-`load_metamathqa_train_like_pissa()`
-- Loads the MetaMathQA training set.
-- Converts the data into the instruction/response format used for fine-tuning.
-
-`load_pissa_metamath_eval()`
-- Loads `fxmeng/pissa-dataset`.
-- Separates the evaluation data into GSM8K and MATH tasks.
-
-`tokenize_supervised_example()`
-- Tokenizes each instruction/response pair.
-- Masks prompt tokens so that training loss is computed only on the response.
-
-`ResponseOnlyCollator`
-- Pads examples into training batches.
-
-### 4. Model Initialization
-
-`PiSSALinear`
-- Custom linear layer containing the frozen residual weight and trainable `pissa_A` / `pissa_B`.
-
-`pissa_from_linear_exact()`
-- Computes the SVD of a pretrained linear layer.
-- Selects the requested singular-value region.
-- Initializes:
+For each target weight matrix W ∈ ℝ^(m×n), take its SVD W = U S Vᵀ and select a window of r
+singular triplets starting at index `s`:
 
 ```text
-A = U_r sqrt(S_r)
-B = sqrt(S_r) V_r^T
+A     = U[:, s:s+r] · √S[s:s+r]           (m × r, trainable)
+B     = √S[s:s+r] · Vᵀ[s:s+r, :]          (r × n, trainable)
+W_res = W − A·B                            (frozen)
+
+forward(x) = x·W_resᵀ + (x·Bᵀ)·Aᵀ
 ```
 
-and stores the remaining weight as:
+After training, the adapter is merged back into the weights (`W_final = W_res + AB`), so inference
+costs nothing extra.
+
+| `component` | Window start `s` | Interpretation |
+| --- | --- | --- |
+| `default` | 0 | Principal directions (original PiSSA) |
+| `quarter` | ⌊k/4⌋ | Upper-middle of the spectrum |
+| `half` | ⌊k/2⌋ | Middle of the spectrum |
+| `bottom` | k − r | Smallest singular values (MiLoRA-style) |
+
+### Experimental Setup
+
+| | |
+| --- | --- |
+| Base model | `meta-llama/Llama-3.2-1B` |
+| Training data | MetaMathQA, first 25k examples, 1 epoch |
+| Evaluation | GSM8K and MATH (PiSSA test split), 1,000 examples each, accuracy |
+| Optimizer | AdamW, lr 2e-5, 3% linear warmup → cosine decay |
+| Batch | 8 per step × 16 accumulation = 128 effective |
+| Sequence length | 512 tokens; loss on response tokens only |
+| Experiment grid | Rank sweep {16, 64, 256} with `default`; position sweep {`default`, `quarter`, `half`, `bottom`} at r = 16; plus a no-fine-tuning baseline |
+| Seed | 42 |
+
+## Results
+
+### Fine-tuning
+
+| Initialization | Rank | Trainable params | GSM8K | MATH |
+| --- | ---: | ---: | ---: | ---: |
+| `bottom` | 16 | 11.3M (0.9%) | 11.6% | 2.6% |
+<!-- TODO: add baseline, default r16/r64/r256, quarter r16, half r16 rows -->
+
+<sub>The r = 16 bottom-spectrum run took 72 min of training on 2× T4 and reached a final training
+loss of 0.506.</sub>
+
+### Spectral analysis of attention weights
+
+How many singular values does a layer need to keep **50% of the spectral energy**
+(Σσᵢ² / Σσ²) of its `q_proj` weight?
+
+| Layer | Rank for 50% energy (of 2,048) |
+| --- | ---: |
+| 0 (first) | 62 |
+| 7 (middle) | 120 |
+| 15 (last) | 84 |
+
+![Cumulative spectral energy of q_proj in layers 0, 7 and 15](figures/q_proj_cumulative_energy.png)
+
+**Takeaways.**
+
+- The spectra are **heavy-tailed but not low-rank.** Even the most concentrated layer needs
+  62 directions to reach half of its energy, so a rank-16 adapter covers only a small part of
+  each matrix.
+- Energy concentration **varies with depth.** The first layer is the most concentrated, and the
+  middle layers are the most spread out. This suggests that a single global rank is not ideal
+  for every layer, which motivates adaptive-rank methods such as AdaLoRA.
+- Initializing from the bottom of the spectrum puts the adapter on directions with almost no
+  energy (σ ≈ 10⁻⁵ to 10⁻³ in some attention layers). That shows how differently the windows
+  start out before any training.
+
+## Repository Structure
 
 ```text
-W_residual = W - AB
+finetune_q1-q3.ipynb   PiSSA implementation, spectral-window initialization, training,
+                       merge, and GSM8K / MATH evaluation
+finetune_q4.ipynb      Singular-value and cumulative-energy analysis of Llama-3.2-1B
+figures/               Spectrum and energy plots per layer
 ```
 
-`inject_pissa()`
-- Replaces the selected linear projection modules (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, and down_proj) in each Llama Transformer layer with `PiSSALinear`.
+## Running the Experiments
 
-The target projections are:
+The notebooks are designed for **Kaggle** (GPU: T4 ×2 or any single CUDA GPU).
 
-```text
-q_proj, k_proj, v_proj, o_proj,
-gate_proj, up_proj, down_proj
-```
+1. Request access to [`meta-llama/Llama-3.2-1B`](https://huggingface.co/meta-llama/Llama-3.2-1B)
+   and add your Hugging Face token as a Kaggle secret named `HF_TOKEN`.
+2. In `finetune_q1-q3.ipynb`, edit the experiment grid:
 
-`merge_pissa_and_unload()`
-- Merges the trained update back into the model:
+   ```python
+   MANUAL_RUNS = [
+       {'rank': 16, 'component': 'default'},
+       {'rank': 16, 'component': 'bottom'},
+   ]
+   RUN_FRESH_BASELINE = True   # also evaluate the un-tuned model
+   ```
 
-```text
-W_final = W_residual + AB
-```
+3. Run all cells. Each run writes a JSON summary, and all runs are collected in
+   `/kaggle/working/Assignment1/benchmark_results.csv`.
+4. `finetune_q4.ipynb` is independent and only needs the model weights.
 
-- Converts the custom PiSSA layers back to normal linear layers for evaluation and saving.
+## Tech Stack
 
-### 5. Training
+Python · PyTorch · Hugging Face Transformers & Datasets · NumPy · Pandas · Matplotlib · Kaggle (2× T4)
 
-`build_optimizer_and_scheduler()`
-- Creates AdamW and the warmup/cosine learning-rate schedule.
+## Acknowledgements
 
-`train_one_task()`
-- Runs one epoch of fine-tuning.
-- Uses FP16 mixed precision and gradient accumulation.
-- Only the PiSSA `A` and `B` matrices are trainable.
-
-### 6. Evaluation
-
-Compute "accuracy" for evaluation.
-
-`evaluate_generation()`
-- Generates answers and computes correctness.
-
-`evaluate_task()` / `evaluate_all_tasks()`
-- Evaluates the model on GSM8K and MATH.
-
-The current repository uses a modified parser that accepts outputs such as:
-
-```text
-The answer is: 42
-Answer: 42
-#### 42
-\boxed{42}
-```
-
-For MATH, answers are first normalized using the PiSSA evaluation method, then a simple numeric comparison is used as a fallback for equivalent values such as 0.5 and 1/2.
-
-### 7. Experiment Runner
-
-`run_fresh_baseline()`
-- Evaluates the original pretrained Llama model.
-
-`run_pissa_experiment()`
-- Loads a fresh model.
-- Injects PiSSA.
-- Trains the selected rank/component.
-- Merges the adapter.
-- Evaluates the performance on GSM8K and MATH.
-- Saves results and model outputs.
-
-`build_run_plan()`
-- Builds the list of experiments from `MANUAL_RUNS`.
-
-Results are written to:
-
-```text
-/kaggle/working/pissa_benchmark
-```
-
-## How to Run ```finetune_q1-q3.ipynb``` on Kaggle
-
-### 1. Enable GPU
-
-Open the notebook in Kaggle and enable a GPU accelerator.  
-Two T4 GPUs can be used through `DataParallel`, but the code also runs with one CUDA GPU.
-
-### 2. Add Hugging Face Token
-
-`Llama-3.2-1B` is a gated model.
-
-1. Request access to `meta-llama/Llama-3.2-1B` on Hugging Face.
-2. Create a Hugging Face access token.
-3. In Kaggle, add the token as a secret named:
-
-```text
-HF_TOKEN
-```
-
-### 3. Model Settings
-
-Edit `MANUAL_RUNS` before training.
-
-`MANUAL_RUNS` is used to configure the SVD settings for fine-tuning the LLM.
-   - 'rank': the target rank used for truncated SVD
-   - 'component': the selected range of singular values, corresponding to the settings in Question 3
-`RUN_FRESH_BASELINE` is used to evaluate the original LLM without fine-tuning.
-   - True: runs the original LLM as the baseline
-   - False: skips the baseline evaluation
-
-Example:
-
-```python
-MANUAL_RUNS = [
-   {'rank': 16, 'component': 'default'},
-]
-
-RUN_FRESH_BASELINE = True
-```
-
-### 4. Run the Main Pipeline
-
-Run the notebook cells in order on Kaggle.
-
-### 5. Output
-
-Training results will be saved in `/kaggle/working/Assignment1/benchmark_results.csv`, 
-including accuracy performance on both datasets.
-
-Under the directory `/kaggle/working/Assignment1/metamath_pissa_{YOUR_COMPONENT_NAME}_r{YOUR_RANK}_full_model/`, you will find files `model.safetensors`, `config.json`, and `generation_config.json`, which can be used to load trained models if needed.
-
-
-## How to Run ```finetune_q4.ipynb``` on Kaggle
-
-### 1. Add Hugging Face Token
-
-You can reuse your HF_TOKEN created in finetune_q1-q3.ipynb by simply enabling it from "Secrets".
-
-### 2. Running the code
-
-The code for Question 4 is separate from the main fine-tuning experiment, since it's independent from the datasets or the settings above.
-
-## Acknowledgement
-
-This project is adapted from the official [PiSSA](https://github.com/MuLabPKU/PiSSA) implementation by Meng et al. The implementation was modified for alternative singular-subspace initialization, custom experiment settings, and robust GSM8K/MATH evaluation.
+This project began as an assignment for a graduate Big Data / LLM course. The adapter design,
+prompt template and MATH answer normalization follow the official
+[PiSSA implementation](https://github.com/MuLabPKU/PiSSA). The spectral-window generalization,
+training and evaluation pipeline, and spectrum analysis are my own.
 
 ## References
 
-1. Meng, F., Wang, Z., & Zhang, M. (2024). **PiSSA: Principal Singular Values and Singular Vectors Adaptation of Large Language Models.** *Advances in Neural Information Processing Systems (NeurIPS 2024)*.  
-   https://arxiv.org/abs/2404.02948
-
-2. MuLabPKU. **PiSSA: Official Implementation.**  
-   https://github.com/MuLabPKU/PiSSA
-
+1. Meng, F., Wang, Z., & Zhang, M. (2024). *PiSSA: Principal Singular Values and Singular Vectors
+   Adaptation of Large Language Models.* NeurIPS 2024. [arXiv:2404.02948](https://arxiv.org/abs/2404.02948)
+2. Hu, E. et al. (2022). *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022.
+3. Wang, H. et al. (2024). *MiLoRA: Harnessing Minor Singular Components for Parameter-Efficient
+   LLM Finetuning.* arXiv:2406.09044.
+4. Yu, L. et al. (2024). *MetaMath: Bootstrap Your Own Mathematical Questions for Large Language
+   Models.* ICLR 2024.
